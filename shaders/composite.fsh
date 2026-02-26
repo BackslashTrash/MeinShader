@@ -154,32 +154,34 @@ void main() {
         scene  = underwaterFog(scene, depth);
 
         if (isWater) {
-            // Decode normal
             vec3 worldNormal = texture2D(colortex1, texcoord).rgb * 2.0 - 1.0;
-            mat3 mv          = transpose(mat3(gbufferModelViewInverse));
-            vec3 viewNormal  = normalize(mv * worldNormal);
+
+            // View direction in world space
             vec3 fragpos     = getViewPos(texcoord, depth);
-            vec3 uPos        = normalize(fragpos);
+            vec3 viewDirView = normalize(fragpos);
+            vec3 viewDirWorld = normalize(mat3(gbufferModelViewInverse) * viewDirView);
 
-            // The normal from below points downward — flip it to face the camera
-            // so the reflection goes UP toward the sky, not down to the floor
-            vec3 surfNormal = dot(viewNormal, uPos) > 0.0 ? -viewNormal : viewNormal;
+            // Make sure normal points toward camera (upward from below)
+            if (dot(worldNormal, vec3(0.0, 1.0, 0.0)) < 0.0) worldNormal = -worldNormal;
 
-            float NdotV = abs(dot(surfNormal, -uPos));
-            float tir   = pow(1.0 - NdotV, 3.0); // total internal reflection
+            float NdotV = abs(dot(worldNormal, -viewDirWorld));
 
-            // For pixels inside Snell's window (~97 degree cone) show sky light
-            // Outside show TIR (reflected floor)
-            vec3 skyLight = underwaterSurface(worldNormal, uPos);
+            // Snell's window — the cone of ~97 degrees through which you can see the sky
+            // Outside this cone is total internal reflection showing the floor
+            float snellWindow = smoothstep(0.10, 0.30, NdotV);
 
-            // SSR for TIR — reflects the floor at steep angles
-            vec3 reflView   = reflect(uPos, surfNormal);
-            vec4 reflection = raytrace(fragpos, reflView);
-            vec3 tirColor   = mix(scene, reflection.rgb, reflection.a);
+            // Sky light coming through — bright teal/cyan at center, darker at edges
+            vec3 worldSunDir = normalize(mat3(gbufferModelViewInverse) * sunPosition);
+            float sunAngle   = max(dot(worldNormal, worldSunDir), 0.0);
+            float sunBeam    = pow(sunAngle, 60.0) * 1.5 + pow(sunAngle, 8.0) * 0.3;
 
-            // Blend: inside Snell's window = sky light, outside = TIR floor reflection
-            // Snell's window is roughly NdotV > 0.26 (within ~75 degrees of straight up)
-            float snellWindow = smoothstep(0.15, 0.35, NdotV);
+            vec3 skyLight = vec3(0.10, 0.42, 0.65);            // base sky color through water
+            skyLight     += vec3(0.20, 0.35, 0.45) * sunBeam;  // sun patch
+            skyLight      = clamp(skyLight, 0.0, 1.0);
+
+            // TIR — just darken the scene tint, no SSR (avoids the streak artifacts)
+            vec3 tirColor = scene * vec3(0.3, 0.5, 0.7);
+
             scene = mix(tirColor, skyLight, snellWindow);
         }
 
