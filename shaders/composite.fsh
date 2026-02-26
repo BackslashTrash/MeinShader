@@ -76,12 +76,10 @@ vec4 raytrace(vec3 fragpos, vec3 rvector) {
         if (pos.x < 0.0 || pos.x > 1.0 ||
         pos.y < 0.0 || pos.y > 1.0 ||
         pos.z < 0.0 || pos.z > 1.0) break;
-
         float sceneDepth = texture2D(depthtex1, pos.xy).r;
         vec3  sceneVPos  = getViewPos(pos.xy, sceneDepth);
         float err        = distance(fragpos, sceneVPos);
         float vectorLen  = length(vector);
-
         if (err < pow(vectorLen * pow(vectorLen, 0.11), 1.1) * 1.1) {
             sr++;
             if (sr >= SSR_REFINE) { result.a = 1.0; break; }
@@ -99,47 +97,6 @@ vec4 raytrace(vec3 fragpos, vec3 rvector) {
     return result;
 }
 
-vec3 underwaterFog(vec3 sceneColor, float depth) {
-    vec3 fogNear = vec3(0.02, 0.18, 0.28);
-    vec3 fogFar  = vec3(0.00, 0.08, 0.18);
-
-    float linearD    = linearizeDepth(depth) * far;
-    float fogDensity = 0.06;
-    float fogAmt     = 1.0 - exp(-linearD * fogDensity);
-    fogAmt = clamp(fogAmt, 0.0, 1.0);
-    fogAmt *= smoothstep(1.0, 4.0, linearD);
-
-    vec3 fogColor = mix(fogNear, fogFar, clamp(linearD / 20.0, 0.0, 1.0));
-
-    vec3 worldPos = mat3(gbufferModelViewInverse) * getViewPos(texcoord, depth) + cameraPosition;
-    float caustic  = sin(worldPos.x * 2.1 + frameTimeCounter * 1.2) *
-    sin(worldPos.z * 1.8 + frameTimeCounter * 0.9) * 0.5 + 0.5;
-    caustic = pow(caustic, 4.0) * 0.08 * (1.0 - fogAmt);
-    sceneColor += vec3(0.0, caustic * 0.2, caustic * 0.35);
-
-    return mix(sceneColor, fogColor, fogAmt);
-}
-
-// Looking up at the surface from below —
-// show sky light coming through, not a floor reflection
-vec3 underwaterSurface(vec3 worldNormal, vec3 viewDir) {
-    // Light filtering down from above — teal/cyan toned
-    vec3 skyLight = vec3(0.06, 0.28, 0.45);
-
-    // Sun visible as a soft bright patch directly above
-    vec3 worldSunDir = normalize(mat3(gbufferModelViewInverse) * sunPosition);
-    float sunAngle   = max(dot(-worldNormal, worldSunDir), 0.0);
-    float sunBeam    = pow(sunAngle, 80.0) * 1.2 + pow(sunAngle, 10.0) * 0.2;
-    skyLight        += vec3(0.15, 0.28, 0.38) * sunBeam;
-
-    // Bright teal ring at grazing angles (snell's window edge)
-    float NdotV  = abs(dot(worldNormal, viewDir));
-    float snell  = pow(1.0 - NdotV, 4.0);
-    skyLight     = mix(skyLight, vec3(0.08, 0.42, 0.62), snell * 0.6);
-
-    return skyLight;
-}
-
 void main() {
     vec4  data    = texture2D(colortex3, texcoord);
     bool  isWater = data.r > 0.5;
@@ -147,43 +104,33 @@ void main() {
     float depth   = texture2D(depthtex0, texcoord).r;
 
     // -----------------------------------------------
-    // UNDERWATER
+    // UNDERWATER — simple depth fog like Oceano
+    // Terrain renders normally, we just add blue tint
+    // and increase fog the deeper you go
     // -----------------------------------------------
     if (isEyeInWater == 1) {
-        scene *= vec3(0.55, 0.80, 0.95);
-        scene  = underwaterFog(scene, depth);
+        float linearD    = linearizeDepth(depth) * far;
+        float fogDensity = 0.04;
+        float fogAmt     = 1.0 - exp(-linearD * fogDensity);
+        fogAmt           = clamp(fogAmt, 0.0, 0.92);
 
-        if (isWater) {
-            vec3 worldNormal = texture2D(colortex1, texcoord).rgb * 2.0 - 1.0;
+        // Bright teal near surface, deep blue far away
+        vec3 fogNear  = vec3(0.05, 0.30, 0.50);
+        vec3 fogFar   = vec3(0.00, 0.08, 0.20);
+        vec3 fogColor = mix(fogNear, fogFar, clamp(linearD / 20.0, 0.0, 1.0));
 
-            // View direction in world space
-            vec3 fragpos     = getViewPos(texcoord, depth);
-            vec3 viewDirView = normalize(fragpos);
-            vec3 viewDirWorld = normalize(mat3(gbufferModelViewInverse) * viewDirView);
+        // Global blue tint simulating water light absorption
+        scene *= vec3(0.75, 0.88, 1.0);
 
-            // Make sure normal points toward camera (upward from below)
-            if (dot(worldNormal, vec3(0.0, 1.0, 0.0)) < 0.0) worldNormal = -worldNormal;
+        // Depth fog
+        scene = mix(scene, fogColor, fogAmt);
 
-            float NdotV = abs(dot(worldNormal, -viewDirWorld));
-
-            // Snell's window — the cone of ~97 degrees through which you can see the sky
-            // Outside this cone is total internal reflection showing the floor
-            float snellWindow = smoothstep(0.10, 0.30, NdotV);
-
-            // Sky light coming through — bright teal/cyan at center, darker at edges
-            vec3 worldSunDir = normalize(mat3(gbufferModelViewInverse) * sunPosition);
-            float sunAngle   = max(dot(worldNormal, worldSunDir), 0.0);
-            float sunBeam    = pow(sunAngle, 60.0) * 1.5 + pow(sunAngle, 8.0) * 0.3;
-
-            vec3 skyLight = vec3(0.10, 0.42, 0.65);            // base sky color through water
-            skyLight     += vec3(0.20, 0.35, 0.45) * sunBeam;  // sun patch
-            skyLight      = clamp(skyLight, 0.0, 1.0);
-
-            // TIR — just darken the scene tint, no SSR (avoids the streak artifacts)
-            vec3 tirColor = scene * vec3(0.3, 0.5, 0.7);
-
-            scene = mix(tirColor, skyLight, snellWindow);
-        }
+        // Subtle caustic shimmer on nearby surfaces
+        vec3 worldPos = mat3(gbufferModelViewInverse) * getViewPos(texcoord, depth) + cameraPosition;
+        float caustic  = sin(worldPos.x * 2.1 + frameTimeCounter * 1.2) *
+        sin(worldPos.z * 1.8 + frameTimeCounter * 0.9) * 0.5 + 0.5;
+        caustic = pow(caustic, 4.0) * 0.06 * (1.0 - fogAmt);
+        scene  += vec3(0.0, caustic * 0.15, caustic * 0.28);
 
         color = vec4(scene, 1.0);
         return;
