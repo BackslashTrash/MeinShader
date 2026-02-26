@@ -8,39 +8,45 @@ in vec2 texcoord;
 in vec2 lmcoord;
 in vec4 glColor;
 in vec3 wpos;
-in vec3 viewPos; // view-space position from vsh
+in vec3 viewPos;
 
 /* DRAWBUFFERS:013 */
-layout(location = 0) out vec4 colorOut;   // colortex0: water base color
-layout(location = 1) out vec4 normalOut;  // colortex1: encoded normal
-layout(location = 2) out vec4 dataOut;    // colortex3: r=isWater, g=fresnel
+layout(location = 0) out vec4 colorOut;
+layout(location = 1) out vec4 normalOut;
+layout(location = 2) out vec4 dataOut;
 
 uniform sampler2D lightmap;
+uniform sampler2D depthtex0;
+uniform sampler2D depthtex1;
 uniform vec3 cameraPosition;
 uniform vec3 sunPosition;
-uniform float frameTimeCounter;
-uniform int isEyeInWater;
 uniform mat4 gbufferModelViewInverse;
+uniform mat4 gbufferProjection;
+uniform float frameTimeCounter;
+uniform float near;
+uniform float far;
+uniform float viewWidth;
+uniform float viewHeight;
+uniform int isEyeInWater;
 
-#define WATER_ROUGHNESS 0.04
-#define WATER_DEEP_COLOR vec3(0.01, 0.08, 0.20)
-#define WATER_SHALLOW_COLOR vec3(0.02, 0.18, 0.38)
+#define WATER_ROUGHNESS 0.022
+#define WATER_DEEP_COLOR    vec3(0.00, 0.32, 0.52)
+#define WATER_SHALLOW_COLOR vec3(0.04, 0.52, 0.72)
 
 // -----------------------------------------------
-// HASH & NOISE PRIMITIVES
+// NOISE
 // -----------------------------------------------
-
 vec2 hash2(vec2 p) {
     p = vec2(dot(p, vec2(127.1, 311.7)),
     dot(p, vec2(269.5, 183.3)));
     return fract(sin(p) * 43758.5453);
 }
 
-// Smooth value noise returning a float in [-1, 1]
 float vnoise(vec2 p) {
     vec2 i = floor(p);
     vec2 f = fract(p);
-    vec2 u = f * f * (3.0 - 2.0 * f); // smoothstep
+    // Quintic interpolation — smoother than cubic, removes derivative discontinuities
+    vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
 
     float a = dot(hash2(i + vec2(0.0, 0.0)), f - vec2(0.0, 0.0));
     float b = dot(hash2(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0));
@@ -51,44 +57,58 @@ float vnoise(vec2 p) {
 }
 
 // -----------------------------------------------
-// FRACTAL BROWNIAN MOTION WATER NORMAL
-// Each octave adds finer ripple detail.
-// WAVE_FREQUENCY controls the base scale.
-// WAVE_ROUGHNESS controls how much the normal deflects.
+// FBM WATER NORMAL
+// Two-layer approach like Oceano:
+// Layer 1: Large slow swells (low freq, high amplitude)
+// Layer 2: Fine surface chop / sparkle (high freq, low amplitude)
 // -----------------------------------------------
 vec3 getWaterNormal(vec3 worldPos) {
     float time = frameTimeCounter;
     float freq = WAVE_FREQUENCY;
+    const float eps = 0.10;
 
-    // Tiny epsilon for finite-difference normal reconstruction
-    const float eps = 0.05;
-
-    // fBm height function — samples multiple octaves of noise
-    // at a given XZ position to produce a wave height
-    #define FBM_HEIGHT(px, pz) (                                        \
-        vnoise(vec2(px, pz) * freq * 1.0  + vec2( 1.0,  0.4) * time * 0.8) * 0.50 + \
-        vnoise(vec2(px, pz) * freq * 2.1  + vec2(-0.5,  1.0) * time * 1.1) * 0.25 + \
-        vnoise(vec2(px, pz) * freq * 4.3  + vec2( 0.3, -0.8) * time * 1.6) * 0.125 + \
-        vnoise(vec2(px, pz) * freq * 8.7  + vec2(-0.7,  0.5) * time * 2.2) * 0.0625 \
+    // --- LARGE SWELLS ---
+    // Low frequency, many varied directions, slow movement
+    // Non-power-of-2 frequency multipliers break up repetition
+    #define SWELL(px, pz) (                                                                  \
+        vnoise(vec2(px, pz) * freq * 0.30 + vec2( 0.50,  0.20) * time * 0.30) * 0.500 +   \
+        vnoise(vec2(px, pz) * freq * 0.51 + vec2(-0.30,  0.60) * time * 0.40) * 0.350 +   \
+        vnoise(vec2(px, pz) * freq * 0.78 + vec2( 0.70, -0.40) * time * 0.35) * 0.250 +   \
+        vnoise(vec2(px, pz) * freq * 1.13 + vec2(-0.60, -0.50) * time * 0.45) * 0.150 +   \
+        vnoise(vec2(px, pz) * freq * 1.67 + vec2( 0.40,  0.80) * time * 0.55) * 0.075     \
     )
 
-    // Sample height at three nearby points and reconstruct the surface normal
-    // using finite differences — standard technique for bump mapping
-    float hC  = FBM_HEIGHT(worldPos.x,       worldPos.z      );
-    float hX  = FBM_HEIGHT(worldPos.x + eps, worldPos.z      );
-    float hZ  = FBM_HEIGHT(worldPos.x,       worldPos.z + eps);
+    // --- SURFACE CHOP ---
+    // High frequency, all directions, faster movement
+    // These create the sparkle/glint effect
+    #define CHOP(px, pz) (                                                                   \
+        vnoise(vec2(px, pz) * freq * 3.50 + vec2( 0.80,  0.30) * time * 1.20) * 0.040 +   \
+        vnoise(vec2(px, pz) * freq * 5.70 + vec2(-0.50,  0.90) * time * 1.60) * 0.025 +   \
+        vnoise(vec2(px, pz) * freq * 8.90 + vec2( 0.30, -0.70) * time * 2.10) * 0.015 +   \
+        vnoise(vec2(px, pz) * freq * 14.3 + vec2(-0.80,  0.40) * time * 2.80) * 0.008     \
+    )
 
-    #undef FBM_HEIGHT
+    #define HEIGHT(px, pz) (SWELL(px, pz) + CHOP(px, pz))
 
-    // dX and dZ are the slope of the surface in each axis
-    float dX = (hX - hC) / eps;
-    float dZ = (hZ - hC) / eps;
+    float hC = HEIGHT(worldPos.x,       worldPos.z      );
+    float hX = HEIGHT(worldPos.x + eps, worldPos.z      );
+    float hZ = HEIGHT(worldPos.x,       worldPos.z + eps);
 
-    // Scale by roughness — higher = more choppy normal deflection
-    dX *= WATER_ROUGHNESS * 8.0;
-    dZ *= WATER_ROUGHNESS * 8.0;
+    #undef SWELL
+    #undef CHOP
+    #undef HEIGHT
+
+    float dX = (hX - hC) / eps * WATER_ROUGHNESS * 5.0;
+    float dZ = (hZ - hC) / eps * WATER_ROUGHNESS * 5.0;
 
     return normalize(vec3(-dX, 1.0, -dZ));
+}
+
+// -----------------------------------------------
+// HELPERS
+// -----------------------------------------------
+float linearizeDepth(float depth) {
+    return (2.0 * near) / (far + near - depth * (far - near));
 }
 
 void main() {
@@ -97,15 +117,52 @@ void main() {
     if (isEyeInWater == 1) normal = -normal;
 
     float NdotV  = max(dot(normal, -viewDir), 0.0);
-    float fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
-    fresnel = max(fresnel, 0.5);
+
+    // Fresnel — physically based Schlick
+    float fresnel = 0.02 + 0.92 * pow(1.0 - NdotV, 5.0);
+
+    // -----------------------------------------------
+    // SUN SPECULAR GLINT
+    // This is what creates the scattered sparkle highlights
+    // visible in the Oceano screenshot.
+    // We compute it here and bake it into the base color
+    // so composite can blend it with the reflection.
+    // -----------------------------------------------
+    vec3 worldSunDir = normalize(mat3(gbufferModelViewInverse) * sunPosition);
+    vec3 halfVec     = normalize(-viewDir + worldSunDir);
+    float NdotH      = max(dot(normal, halfVec), 0.0);
+
+    // Two-lobe specular: wide soft halo + tight bright sparkle
+    float specSoft   = pow(NdotH, 80.0)  * 0.6;
+    float specSharp  = pow(NdotH, 600.0) * 3.0;
+    vec3  sunGlint   = vec3(1.0, 0.97, 0.90) * (specSoft + specSharp);
+
+    // -----------------------------------------------
+    // DEPTH-BASED TRANSPARENCY
+    // -----------------------------------------------
+    vec2  screenUV      = gl_FragCoord.xy / vec2(viewWidth, viewHeight);
+    float depthSurface  = linearizeDepth(texture2D(depthtex0, screenUV).r);
+    float depthSeafloor = linearizeDepth(texture2D(depthtex1, screenUV).r);
+    float waterDepth    = (depthSeafloor - depthSurface) * far;
+
+    // Smooth transition: transparent <3 blocks, opaque >8 blocks
+    float depthFade = smoothstep(0.0, 1.0, clamp(waterDepth / 8.0, 0.0, 1.0));
 
     vec3 lm = texture2D(lightmap, lmcoord).rgb;
-    vec3 waterBodyColor = mix(WATER_DEEP_COLOR, WATER_SHALLOW_COLOR, pow(1.0 - NdotV, 2.0));
-    waterBodyColor *= max(lm, vec3(0.02));
 
-    // Write base color, encoded normal, and water flag
-    colorOut  = vec4(waterBodyColor, 1.0);
+    // Base water color
+    vec3 waterTint = mix(WATER_SHALLOW_COLOR, WATER_DEEP_COLOR, depthFade);
+    waterTint *= max(lm, vec3(0.02));
+
+    // Add sun glint into base color — scaled by lightmap so caves stay dark
+    waterTint += sunGlint * max(lm.g, 0.0);
+
+    // Alpha — shallow = see-through, deep = opaque, grazing = more reflective
+    float shallowAlpha = mix(0.20, 0.92, pow(fresnel, 0.6));
+    float alpha        = mix(shallowAlpha, 0.97, depthFade);
+    if (isEyeInWater == 1) alpha = 1.0;
+
+    colorOut  = vec4(waterTint, alpha);
     normalOut = vec4(normal * 0.5 + 0.5, 1.0);
-    dataOut   = vec4(1.0, fresnel, 0.0, 1.0); // r=1.0 = is water
+    dataOut   = vec4(1.0, fresnel, 0.0, 1.0);
 }
