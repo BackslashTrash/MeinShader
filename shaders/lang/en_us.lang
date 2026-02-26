@@ -1,0 +1,23 @@
+screen.WATER_SETTINGS=Water Settings
+
+option.WAVE_AMPLITUDE=Wave Height
+option.WAVE_AMPLITUDE.comment=How tall the waves are. 0 = flat water.
+
+option.WAVE_SPEED=Wave Speed
+option.WAVE_SPEED.comment=How fast the waves animate.
+
+option.WAVE_FREQUENCY=Wave Frequency
+option.WAVE_FREQUENCY.comment=How tightly packed the ripples are.
+
+screen.SSAO_SETTINGS= SSAO Settings
+option.SSAO_INTENSITY=SSAO Intensity
+option.SSAO_INTENSITY.comment=How intense SSAO effect is
+
+option.SSAO_INTENSITY=SSAO Radius
+option.SSAO_INTENSITY.comment=Radius of SSAO
+
+option.SSAO_SAMPLES= SSAO Sample amount
+option.SSAO_SAMPLES.comment=SSAO Sample amount
+
+option.SSAO_BIAS= SSAO Bias
+option.SSAO_BIAS.comment=SSAO Bias
