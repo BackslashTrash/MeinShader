@@ -4,18 +4,17 @@
 #define WAVE_SPEED 1.5      // [0.0 0.5 0.8 1.0 1.2 1.5 1.8 2.0 2.5 3.0 4.0 5.0]
 #define WAVE_FREQUENCY 1.0  // [0.2 0.4 0.6 0.8 1.0 1.2 1.5 1.8 2.0 2.5 3.0 4.0]
 
-// ---- INPUTS from vertex shader ----
 in vec2 texcoord;
 in vec2 lmcoord;
 in vec4 glColor;
 in vec3 wpos;
+in vec3 viewPos; // view-space position from vsh
 
-// ---- OUTPUT ----
-/* DRAWBUFFERS:0 */
-layout(location = 0) out vec4 colorOut;
+/* DRAWBUFFERS:013 */
+layout(location = 0) out vec4 colorOut;   // colortex0: water base color
+layout(location = 1) out vec4 normalOut;  // colortex1: encoded normal
+layout(location = 2) out vec4 dataOut;    // colortex3: r=isWater, g=fresnel
 
-// ---- UNIFORMS ----
-uniform sampler2D texture;
 uniform sampler2D lightmap;
 uniform vec3 cameraPosition;
 uniform vec3 sunPosition;
@@ -23,94 +22,90 @@ uniform float frameTimeCounter;
 uniform int isEyeInWater;
 uniform mat4 gbufferModelViewInverse;
 
-// -----------------------------------------------
-// WATER APPEARANCE SETTINGS
-// -----------------------------------------------
-#define WATER_ROUGHNESS 0.08
-#define REFLECTION_STRENGTH 0.85
-#define WATER_DEEP_COLOR vec3(0.0, 0.25, 0.55)
-#define WATER_SHALLOW_COLOR vec3(0.0, 0.55, 0.75)
+#define WATER_ROUGHNESS 0.04
+#define WATER_DEEP_COLOR vec3(0.01, 0.08, 0.20)
+#define WATER_SHALLOW_COLOR vec3(0.02, 0.18, 0.38)
 
 // -----------------------------------------------
-// NORMAL HELPERS
+// HASH & NOISE PRIMITIVES
 // -----------------------------------------------
-vec2 waveNormalLayer(vec3 worldPos, float time, float scale, float speed, vec2 dir) {
-    vec2 uv = worldPos.xz * scale + dir * time * speed;
-    float dx = cos(uv.x + sin(uv.y * 0.7));
-    float dz = sin(uv.y + cos(uv.x * 0.7));
-    return vec2(dx, dz);
+
+vec2 hash2(vec2 p) {
+    p = vec2(dot(p, vec2(127.1, 311.7)),
+    dot(p, vec2(269.5, 183.3)));
+    return fract(sin(p) * 43758.5453);
 }
 
+// Smooth value noise returning a float in [-1, 1]
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f); // smoothstep
+
+    float a = dot(hash2(i + vec2(0.0, 0.0)), f - vec2(0.0, 0.0));
+    float b = dot(hash2(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0));
+    float c = dot(hash2(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0));
+    float d = dot(hash2(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0));
+
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// -----------------------------------------------
+// FRACTAL BROWNIAN MOTION WATER NORMAL
+// Each octave adds finer ripple detail.
+// WAVE_FREQUENCY controls the base scale.
+// WAVE_ROUGHNESS controls how much the normal deflects.
+// -----------------------------------------------
 vec3 getWaterNormal(vec3 worldPos) {
     float time = frameTimeCounter;
     float freq = WAVE_FREQUENCY;
 
-    vec2 n1 = waveNormalLayer(worldPos, time, freq * 1.0, 1.2, vec2(1.0,  0.4));
-    vec2 n2 = waveNormalLayer(worldPos, time, freq * 1.7, 0.9, vec2(-0.5, 1.0));
-    vec2 n3 = waveNormalLayer(worldPos, time, freq * 0.4, 0.5, vec2(0.3, -0.8));
+    // Tiny epsilon for finite-difference normal reconstruction
+    const float eps = 0.05;
 
-    float strength = WATER_ROUGHNESS * 0.15;
-    vec2 combined = (n1 * 0.5 + n2 * 0.3 + n3 * 0.2) * strength;
+    // fBm height function — samples multiple octaves of noise
+    // at a given XZ position to produce a wave height
+    #define FBM_HEIGHT(px, pz) (                                        \
+        vnoise(vec2(px, pz) * freq * 1.0  + vec2( 1.0,  0.4) * time * 0.8) * 0.50 + \
+        vnoise(vec2(px, pz) * freq * 2.1  + vec2(-0.5,  1.0) * time * 1.1) * 0.25 + \
+        vnoise(vec2(px, pz) * freq * 4.3  + vec2( 0.3, -0.8) * time * 1.6) * 0.125 + \
+        vnoise(vec2(px, pz) * freq * 8.7  + vec2(-0.7,  0.5) * time * 2.2) * 0.0625 \
+    )
 
-    return normalize(vec3(-combined.x, 1.0, -combined.y));
+    // Sample height at three nearby points and reconstruct the surface normal
+    // using finite differences — standard technique for bump mapping
+    float hC  = FBM_HEIGHT(worldPos.x,       worldPos.z      );
+    float hX  = FBM_HEIGHT(worldPos.x + eps, worldPos.z      );
+    float hZ  = FBM_HEIGHT(worldPos.x,       worldPos.z + eps);
+
+    #undef FBM_HEIGHT
+
+    // dX and dZ are the slope of the surface in each axis
+    float dX = (hX - hC) / eps;
+    float dZ = (hZ - hC) / eps;
+
+    // Scale by roughness — higher = more choppy normal deflection
+    dX *= WATER_ROUGHNESS * 8.0;
+    dZ *= WATER_ROUGHNESS * 8.0;
+
+    return normalize(vec3(-dX, 1.0, -dZ));
 }
 
-// -----------------------------------------------
-// MAIN
-// -----------------------------------------------
 void main() {
-    vec4 albedo = texture2D(texture, texcoord) * glColor;
-
     vec3 viewDir = normalize(wpos - cameraPosition);
     vec3 normal  = getWaterNormal(wpos);
     if (isEyeInWater == 1) normal = -normal;
 
-    // FRESNEL
     float NdotV  = max(dot(normal, -viewDir), 0.0);
-    float fresnel = 0.02 + (REFLECTION_STRENGTH - 0.02) * pow(1.0 - NdotV, 5.0);
+    float fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
+    fresnel = max(fresnel, 0.5);
 
-    // SUN DIRECTION
-    // sunPosition is in view space in Iris, convert to world space
-    vec3 worldSunDir = normalize(mat3(gbufferModelViewInverse) * sunPosition);
-
-    // REFLECTION DIRECTION with roughness jitter
-    vec3 reflDir = reflect(viewDir, normal);
-    vec3 up      = abs(reflDir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 tangent = normalize(cross(up, reflDir));
-    vec3 bitang  = cross(reflDir, tangent);
-    float spread      = WATER_ROUGHNESS * 0.5;
-    vec3 roughReflDir = normalize(reflDir + tangent * normal.x * spread + bitang * normal.z * spread);
-
-    // SKY GRADIENT
-    vec3 horizonCol = vec3(0.55, 0.78, 0.95);
-    vec3 zenithCol  = vec3(0.08, 0.30, 0.72);
-    vec3 sunsetCol  = vec3(0.80, 0.55, 0.25);
-    float upFactor     = clamp(roughReflDir.y, 0.0, 1.0);
-    float sunsetFactor = pow(clamp(1.0 - abs(roughReflDir.y), 0.0, 1.0), 4.0);
-    vec3 skyRefl = mix(mix(horizonCol, zenithCol, upFactor), sunsetCol, sunsetFactor * 0.35);
-
-    // SUN GLINT
-    float sunDot         = max(dot(roughReflDir, worldSunDir), 0.0);
-    float glintSharpness = mix(2000.0, 80.0, WATER_ROUGHNESS * 3.0);
-    float sunGlint       = pow(sunDot, glintSharpness) * mix(8.0, 1.5, WATER_ROUGHNESS * 2.0);
-    skyRefl += vec3(1.0, 0.92, 0.75) * sunGlint;
-
-    // WATER BODY COLOR
-    vec3 waterBodyColor = mix(WATER_DEEP_COLOR, WATER_SHALLOW_COLOR, pow(1.0 - NdotV, 3.0));
-    waterBodyColor = mix(waterBodyColor, albedo.rgb, 0.25);
-
-    // COMBINE
-    vec3 finalColor = mix(waterBodyColor, skyRefl, fresnel);
     vec3 lm = texture2D(lightmap, lmcoord).rgb;
-    finalColor *= max(lm, vec3(0.04));
-    finalColor  = mix(waterBodyColor, finalColor, 0.85);
-    finalColor += waterBodyColor * 0.15;
+    vec3 waterBodyColor = mix(WATER_DEEP_COLOR, WATER_SHALLOW_COLOR, pow(1.0 - NdotV, 2.0));
+    waterBodyColor *= max(lm, vec3(0.02));
 
-    float alpha = mix(0.82, 0.97, fresnel);
-    if (isEyeInWater == 1) {
-        alpha       = 1.0;
-        finalColor  = mix(finalColor, WATER_DEEP_COLOR * lm, 0.5);
-    }
-
-    colorOut = vec4(finalColor, alpha);
+    // Write base color, encoded normal, and water flag
+    colorOut  = vec4(waterBodyColor, 1.0);
+    normalOut = vec4(normal * 0.5 + 0.5, 1.0);
+    dataOut   = vec4(1.0, fresnel, 0.0, 1.0); // r=1.0 = is water
 }
