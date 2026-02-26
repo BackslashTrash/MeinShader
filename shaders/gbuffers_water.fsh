@@ -30,17 +30,10 @@ uniform mat4 gbufferModelViewInverse;
 // -----------------------------------------------
 // How blurry/rough the reflections are. 0.0 = mirror, 1.0 = very rough.
 // Real lakes sit around 0.08–0.15. Choppy sea ~0.25.
-#define WATER_ROUGHNESS 0.12
-
-// Overall reflection brightness. 1.0 = physically based, lower = more transparent look.
-#define REFLECTION_STRENGTH 0.65
-
-// Deep water base tint (what you see looking straight down)
-#define WATER_DEEP_COLOR vec3(0.04, 0.18, 0.32)
-
-// Shallow water tint (at grazing angles near shore)
-#define WATER_SHALLOW_COLOR vec3(0.15, 0.42, 0.55)
-
+#define WATER_ROUGHNESS 0.08
+#define REFLECTION_STRENGTH 0.85
+#define WATER_DEEP_COLOR vec3(0.0, 0.25, 0.55)
+#define WATER_SHALLOW_COLOR vec3(0.0, 0.55, 0.75)
 // -----------------------------------------------
 // NORMAL HELPERS
 // -----------------------------------------------
@@ -143,17 +136,24 @@ void main() {
     // -----------------------------------------------
     // COMBINE
     // -----------------------------------------------
+    // -----------------------------------------------
+    // COMBINE
+    // -----------------------------------------------
     vec3 finalColor = mix(waterBodyColor, skyRefl, fresnel);
 
     // Apply lightmap so underwater caves stay dark
     vec3 lm = texture2D(lightmap, lmcoord).rgb;
     finalColor *= max(lm, vec3(0.04));
 
-    // Alpha: more opaque at grazing angles, more transparent looking straight down
-    float alpha = mix(albedo.a * 0.75, 0.92, fresnel);
+    // Force a strong tropical blue base so the water is never transparent-looking
+    finalColor = mix(waterBodyColor, finalColor, 0.85);
+    finalColor += waterBodyColor * 0.15;
+
+    // Alpha: fully opaque so you can't see through it like glass
+    float alpha = mix(0.82, 0.97, fresnel);
     if (isEyeInWater == 1) {
-        alpha = albedo.a;
-        finalColor = mix(finalColor, albedo.rgb * lm, 0.4);
+        alpha = 1.0;
+        finalColor = mix(finalColor, WATER_DEEP_COLOR * lm, 0.5);
     }
 
     colorOut = vec4(finalColor, alpha);
