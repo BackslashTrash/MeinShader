@@ -29,6 +29,15 @@ const float SSR_STEP_INC    = 2.0;
 const int   SSR_REFINE      = 3;
 const float SSR_REFINE_MULT = 0.1;
 
+// =====================================================
+// ADDED: Enhanced Underwater Effects (Oceano-inspired)
+// =====================================================
+const vec3 waterColorShallow = vec3(0.32, 0.78, 0.88);  // Bright turquoise - horizontal views
+const vec3 waterColorDeep    = vec3(0.01, 0.09, 0.28);  // Deep navy - looking down
+
+// =====================================================
+// YOUR ORIGINAL HELPERS (moved to top so everything compiles)
+// =====================================================
 vec3 getViewPos(vec2 uv, float depth) {
     vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     vec4 vp  = gbufferProjectionInverse * ndc;
@@ -97,48 +106,96 @@ vec4 raytrace(vec3 fragpos, vec3 rvector) {
     return result;
 }
 
+// =====================================================
+// NEW Underwater Functions (now AFTER helpers)
+// =====================================================
+// 3. Screen distortion (wavy refraction)
+vec2 applyScreenDistortion(vec2 coord) {
+    float t = frameTimeCounter * 2.8;
+
+    float waveX = sin(coord.y * 28.0 + t * 4.2) * 0.0016 +
+    sin(coord.x * 19.0 + t * 2.1) * 0.0011;
+
+    float waveY = sin(coord.x * 24.0 + t * 3.7) * 0.0014 +
+    cos(coord.y * 15.0 + t * 1.9) * 0.0009;
+
+    vec2 offset = vec2(waveX, waveY);
+    return clamp(coord + offset, 0.001, 0.999);
+}
+
+// View direction for horizontal Fresnel color shift
+vec3 getWorldViewDirection(vec2 uv) {
+    vec3 viewPos = getViewPos(uv, 1.0); // far-plane direction
+    return normalize(viewPos);
+}
+
+// 2. Light absorption + fog
+vec3 applyUnderwaterFog(vec3 sceneColor, float linearDepth, vec3 viewDir) {
+    const float FOG_DENSITY = 0.085;   // ← TUNE THIS! 0.04 = crystal clear, 0.12 = thick murk
+
+    float fogFactor = 1.0 - exp(-linearDepth * FOG_DENSITY);
+    fogFactor = clamp(fogFactor, 0.0, 0.92);
+
+    float horizontalFactor = 1.0 - abs(viewDir.y);
+    vec3 waterTint = mix(waterColorDeep, waterColorShallow, horizontalFactor * 0.75);
+
+    vec3 fogged = mix(sceneColor, waterTint, fogFactor);
+    fogged *= vec3(0.75, 0.88, 1.0);   // global absorption tint
+
+    return fogged;
+}
+
+// =====================================================
+// MAIN - Your original structure, underwater upgraded
+// =====================================================
 void main() {
     vec4  data    = texture2D(colortex3, texcoord);
     bool  isWater = data.r > 0.5;
-    vec3  scene   = texture2D(colortex0, texcoord).rgb;
     float depth   = texture2D(depthtex0, texcoord).r;
 
-    // -----------------------------------------------
-    // UNDERWATER — simple depth fog like Oceano
-    // Terrain renders normally, we just add blue tint
-    // and increase fog the deeper you go
-    // -----------------------------------------------
+    // ===============================================
+    // ENHANCED UNDERWATER (distortion + fog)
+    // ===============================================
+    // ===============================================
+    // ENHANCED UNDERWATER (distortion + fog) — FIXED
+    // ===============================================
     if (isEyeInWater == 1) {
-        float linearD    = linearizeDepth(depth) * far;
-        float fogDensity = 0.04;
-        float fogAmt     = 1.0 - exp(-linearD * fogDensity);
-        fogAmt           = clamp(fogAmt, 0.0, 0.92);
+        bool isSurfaceFromBelow = (data.r > 0.5) && (texture2D(depthtex0, texcoord).r > 0.999);  // very far depth = sky surface
 
-        // Bright teal near surface, deep blue far away
-        vec3 fogNear  = vec3(0.05, 0.30, 0.50);
-        vec3 fogFar   = vec3(0.00, 0.08, 0.20);
-        vec3 fogColor = mix(fogNear, fogFar, clamp(linearD / 20.0, 0.0, 1.0));
+        vec2 coordToSample = isSurfaceFromBelow ? texcoord : applyScreenDistortion(texcoord);
 
-        // Global blue tint simulating water light absorption
-        scene *= vec3(0.75, 0.88, 1.0);
+        vec3  scene = texture2D(colortex0, coordToSample).rgb;
+        float distortedDepth = texture2D(depthtex0, coordToSample).r;
 
-        // Depth fog
-        scene = mix(scene, fogColor, fogAmt);
+        float linearD = linearizeDepth(distortedDepth) * far;
 
-        // Subtle caustic shimmer on nearby surfaces
-        vec3 worldPos = mat3(gbufferModelViewInverse) * getViewPos(texcoord, depth) + cameraPosition;
-        float caustic  = sin(worldPos.x * 2.1 + frameTimeCounter * 1.2) *
-        sin(worldPos.z * 1.8 + frameTimeCounter * 0.9) * 0.5 + 0.5;
-        caustic = pow(caustic, 4.0) * 0.06 * (1.0 - fogAmt);
-        scene  += vec3(0.0, caustic * 0.15, caustic * 0.28);
+        vec3 viewDir = getWorldViewDirection(texcoord);
+
+        // Light fog on surface, full fog on deep water
+        if (isSurfaceFromBelow) {
+            scene = mix(scene, vec3(0.6, 0.85, 1.0), 0.35);  // gentle sky tint
+        } else {
+            scene = applyUnderwaterFog(scene, linearD, viewDir);
+        }
+
+        // Your caustic (only on terrain, not surface)
+        if (!isSurfaceFromBelow) {
+            vec3 worldPos = mat3(gbufferModelViewInverse) * getViewPos(coordToSample, distortedDepth) + cameraPosition;
+            float caustic = sin(worldPos.x * 2.1 + frameTimeCounter * 1.2) *
+            sin(worldPos.z * 1.8 + frameTimeCounter * 0.9) * 0.5 + 0.5;
+            caustic = pow(caustic, 4.0) * 0.06 * (1.0 - clamp(linearD / 25.0, 0.0, 1.0));
+            scene += vec3(0.0, caustic * 0.15, caustic * 0.28);
+        }
 
         color = vec4(scene, 1.0);
         return;
     }
 
-    // -----------------------------------------------
-    // ABOVE WATER — NON-WATER PIXEL
-    // -----------------------------------------------
+    // ===============================================
+    // ABOVE WATER - NON-WATER PIXEL (original)
+    // ===============================================
+    vec3  scene   = texture2D(colortex0, texcoord).rgb;
+
     if (!isWater) {
         float luminance = dot(scene, vec3(0.299, 0.587, 0.114));
         scene = mix(vec3(luminance), scene, 1.30);
@@ -147,9 +204,9 @@ void main() {
         return;
     }
 
-    // -----------------------------------------------
-    // ABOVE WATER — WATER SURFACE PIXEL
-    // -----------------------------------------------
+    // ===============================================
+    // ABOVE WATER - WATER SURFACE PIXEL (original)
+    // ===============================================
     float fresnel    = data.g;
     vec3  waterBase  = scene;
 

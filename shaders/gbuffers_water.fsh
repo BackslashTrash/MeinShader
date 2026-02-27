@@ -16,8 +16,8 @@ layout(location = 1) out vec4 normalOut;
 layout(location = 2) out vec4 dataOut;
 
 uniform sampler2D lightmap;
-uniform sampler2D depthtex0;
-uniform sampler2D depthtex1;
+uniform sampler2D depthtex0; // DO NOT sample this in this pass
+uniform sampler2D depthtex1; // Opaque depth before water
 uniform vec3 cameraPosition;
 uniform vec3 sunPosition;
 uniform mat4 gbufferModelViewInverse;
@@ -45,7 +45,7 @@ vec2 hash2(vec2 p) {
 float vnoise(vec2 p) {
     vec2 i = floor(p);
     vec2 f = fract(p);
-    // Quintic interpolation — smoother than cubic, removes derivative discontinuities
+    // Quintic interpolation
     vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
 
     float a = dot(hash2(i + vec2(0.0, 0.0)), f - vec2(0.0, 0.0));
@@ -58,18 +58,12 @@ float vnoise(vec2 p) {
 
 // -----------------------------------------------
 // FBM WATER NORMAL
-// Two-layer approach like Oceano:
-// Layer 1: Large slow swells (low freq, high amplitude)
-// Layer 2: Fine surface chop / sparkle (high freq, low amplitude)
 // -----------------------------------------------
 vec3 getWaterNormal(vec3 worldPos) {
     float time = frameTimeCounter;
     float freq = WAVE_FREQUENCY;
     const float eps = 0.10;
 
-    // --- LARGE SWELLS ---
-    // Low frequency, many varied directions, slow movement
-    // Non-power-of-2 frequency multipliers break up repetition
     #define SWELL(px, pz) (                                                                  \
         vnoise(vec2(px, pz) * freq * 0.30 + vec2( 0.50,  0.20) * time * 0.30) * 0.500 +   \
         vnoise(vec2(px, pz) * freq * 0.51 + vec2(-0.30,  0.60) * time * 0.40) * 0.350 +   \
@@ -78,9 +72,6 @@ vec3 getWaterNormal(vec3 worldPos) {
         vnoise(vec2(px, pz) * freq * 1.67 + vec2( 0.40,  0.80) * time * 0.55) * 0.075     \
     )
 
-    // --- SURFACE CHOP ---
-    // High frequency, all directions, faster movement
-    // These create the sparkle/glint effect
     #define CHOP(px, pz) (                                                                   \
         vnoise(vec2(px, pz) * freq * 3.50 + vec2( 0.80,  0.30) * time * 1.20) * 0.040 +   \
         vnoise(vec2(px, pz) * freq * 5.70 + vec2(-0.50,  0.90) * time * 1.60) * 0.025 +   \
@@ -117,50 +108,52 @@ void main() {
     if (isEyeInWater == 1) normal = -normal;
 
     float NdotV  = max(dot(normal, -viewDir), 0.0);
-
-    // Fresnel — physically based Schlick
     float fresnel = 0.02 + 0.92 * pow(1.0 - NdotV, 5.0);
 
     // -----------------------------------------------
     // SUN SPECULAR GLINT
-    // This is what creates the scattered sparkle highlights
-    // visible in the Oceano screenshot.
-    // We compute it here and bake it into the base color
-    // so composite can blend it with the reflection.
     // -----------------------------------------------
     vec3 worldSunDir = normalize(mat3(gbufferModelViewInverse) * sunPosition);
     vec3 halfVec     = normalize(-viewDir + worldSunDir);
     float NdotH      = max(dot(normal, halfVec), 0.0);
 
-    // Two-lobe specular: wide soft halo + tight bright sparkle
     float specSoft   = pow(NdotH, 80.0)  * 0.6;
     float specSharp  = pow(NdotH, 600.0) * 3.0;
     vec3  sunGlint   = vec3(1.0, 0.97, 0.90) * (specSoft + specSharp);
 
     // -----------------------------------------------
-    // DEPTH-BASED TRANSPARENCY
+    // DEPTH-BASED TRANSPARENCY (FIXED)
     // -----------------------------------------------
     vec2  screenUV      = gl_FragCoord.xy / vec2(viewWidth, viewHeight);
-    float depthSurface  = linearizeDepth(texture2D(depthtex0, screenUV).r);
-    float depthSeafloor = linearizeDepth(texture2D(depthtex1, screenUV).r);
-    float waterDepth    = (depthSeafloor - depthSurface) * far;
 
-    // Smooth transition: transparent <3 blocks, opaque >8 blocks
-    float depthFade = smoothstep(0.0, 1.0, clamp(waterDepth / 8.0, 0.0, 1.0));
+    // FIX: Use gl_FragCoord.z to get the current fragment's depth safely
+    float currentDepth  = linearizeDepth(gl_FragCoord.z);
+
+    // depthtex1 safely contains the opaque geometry behind the water
+    float depthSeafloor = linearizeDepth(texture2D(depthtex1, screenUV).r);
+
+    float waterDepth    = (depthSeafloor - currentDepth) * far;
+    float depthFade     = smoothstep(0.0, 1.0, clamp(waterDepth / 8.0, 0.0, 1.0));
 
     vec3 lm = texture2D(lightmap, lmcoord).rgb;
 
-    // Base water color
     vec3 waterTint = mix(WATER_SHALLOW_COLOR, WATER_DEEP_COLOR, depthFade);
     waterTint *= max(lm, vec3(0.02));
-
-    // Add sun glint into base color — scaled by lightmap so caves stay dark
     waterTint += sunGlint * max(lm.g, 0.0);
 
-    // Alpha — shallow = see-through, deep = opaque, grazing = more reflective
     float shallowAlpha = mix(0.20, 0.92, pow(fresnel, 0.6));
     float alpha        = mix(shallowAlpha, 0.97, depthFade);
-    if (isEyeInWater == 1) alpha = 1.0;
+
+    // -----------------------------------------------
+    // UNDERWATER VIEWING (FIXED)
+    // -----------------------------------------------
+    if (isEyeInWater == 1) {
+        // We set the alpha to be transparent so we can see through the underside
+        alpha = 0.4;
+
+        // Add a slight sky-blue tint so looking up feels natural
+        waterTint = mix(waterTint, vec3(0.5, 0.8, 1.0), 0.35);
+    }
 
     colorOut  = vec4(waterTint, alpha);
     normalOut = vec4(normal * 0.5 + 0.5, 1.0);
